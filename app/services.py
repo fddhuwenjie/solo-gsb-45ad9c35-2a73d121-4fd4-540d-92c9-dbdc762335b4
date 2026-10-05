@@ -1,7 +1,13 @@
 import json
 
 from .db import now_iso, audit
-from .evaluation import evaluate
+from .evaluation import (
+    evaluate,
+    coverage_info,
+    HIGH_TEMP_K, MED_TEMP_K, CONTRADICTION_SPREAD_K, DISTANCE_TOL_M,
+    RETEST_OK, RETEST_STALE, RETEST_SUPERSEDED,
+    REVIEW_OK, REVIEW_STALE,
+)
 
 
 # ---------- 读取辅助 ----------
@@ -47,16 +53,43 @@ def _joints_touched(conn, batch_id):
     return [r["joint_id"] for r in rows]
 
 
-def _gate_for(joint_label, concl, active_obs, reviews):
-    """高风险接头封存门槛：必须有当前复测或明确人工复核意见。"""
+def _retest_obs_desc(obs):
+    return "观测#" + "、#".join(str(o["id"]) for o in obs)
+
+
+def _gate_for(joint_label, concl, cov):
+    """高风险接头封存门槛：必须有覆盖最新证据的当前复测或明确人工复核意见。
+
+    判定按当前有效观测的 recorded_at 与更正链：
+    - 被更正（superseded）的复测不算当前证据；
+    - recorded_at 早于最新有效观测的复测/复核意见已过期；
+    - 较早时间的回填观测不会使时间更晚的复测/意见过期。
+    """
     if concl is None or concl["risk_level"] != "high":
         return None
-    has_retest = any(o["is_retest"] for o in active_obs)
-    if has_retest or len(reviews) > 0:
+    if cov["retest_status"] == RETEST_OK or cov["review_status"] == REVIEW_OK:
         return None
+
+    parts = []
+    if cov["retest_status"] == RETEST_STALE:
+        parts.append(
+            f"复测读数（{_retest_obs_desc(cov['stale_retest_obs'])}，记录时间 "
+            f"{cov['latest_retest_at']}）早于最新有效观测"
+            f"（{'、'.join('#' + str(i) for i in cov['latest_obs_ids'])}，"
+            f"记录时间 {cov['latest_obs_at']}），未覆盖最新证据，已过期")
+    elif cov["retest_status"] == RETEST_SUPERSEDED:
+        parts.append("原复测读数（" + _retest_obs_desc(cov["superseded_retest_obs"]) +
+                     "）已被更正，不属于当前证据")
+    else:
+        parts.append("尚无复测读数")
+    if cov["review_status"] == REVIEW_STALE:
+        parts.append(f"最近人工复核意见（记录时间 {cov['latest_review_at']}）早于最新有效观测"
+                     f"（记录时间 {cov['latest_obs_at']}），未覆盖最新证据，已过期")
+    else:
+        parts.append("尚无明确人工复核意见")
     return (
-        f"高风险接头 {joint_label} 缺少当前复测读数与明确人工复核意见，"
-        "封存前必须补齐其中至少一项"
+        f"高风险接头 {joint_label} 缺少覆盖最新证据的当前复测读数与明确人工复核意见（"
+        + "；".join(parts) + "），封存前必须补齐其中至少一项"
     )
 
 
@@ -71,8 +104,9 @@ def recompute_joint(conn, joint_id, batch_id, invalidated_reason=None):
         )
 
     active = _active_observations(conn, joint_id, batch_id)
+    all_obs = _all_observations(conn, joint_id, batch_id)
     reviews = _reviews(conn, joint_id, batch_id)
-    result = evaluate(active, reviews)
+    result = evaluate(active, reviews, all_obs=all_obs)
     cur = conn.execute(
         "INSERT INTO conclusions(joint_id, batch_id, state, risk_level, confidence, "
         "max_temp_diff_k, spread_k, reason, dispositions, supersedes_id, created_at) "
@@ -227,9 +261,11 @@ def batch_overview(conn, batch_id):
     for r in rows:
         concl = _current_conclusion(conn, r["joint_id"], batch_id)
         active = _active_observations(conn, r["joint_id"], batch_id)
+        all_obs = _all_observations(conn, r["joint_id"], batch_id)
         reviews = _reviews(conn, r["joint_id"], batch_id)
+        cov = coverage_info(active, all_obs, reviews)
         label = f"{r['line_name']} {r['mileage']} {r['joint_no']}"
-        blocker = _gate_for(label, concl, active, reviews)
+        blocker = _gate_for(label, concl, cov)
         if blocker:
             blockers.append(blocker)
         d = dict(r)
@@ -237,7 +273,12 @@ def batch_overview(conn, batch_id):
         if d["conclusion"]:
             d["conclusion"]["dispositions"] = json.loads(concl["dispositions"])
         d["seal_blocker"] = blocker
-        d["has_retest"] = any(o["is_retest"] for o in active)
+        d["has_retest"] = cov["retest_status"] == RETEST_OK
+        d["retest_status"] = cov["retest_status"]
+        d["review_status"] = cov["review_status"]
+        d["latest_obs_at"] = cov["latest_obs_at"]
+        d["latest_retest_at"] = cov["latest_retest_at"]
+        d["latest_review_at"] = cov["latest_review_at"]
         joints.append(d)
 
     sealed = conn.execute(
@@ -275,13 +316,19 @@ def build_snapshot(conn, batch_id):
             "reviews": [dict(rv) for rv in reviews],
             "conclusion_history": [dict(h) for h in history],
             "seal_blocker": j["seal_blocker"],
+            "retest_status": j["retest_status"],
+            "review_status": j["review_status"],
+            "latest_obs_at": j["latest_obs_at"],
+            "latest_retest_at": j["latest_retest_at"],
+            "latest_review_at": j["latest_review_at"],
         })
     return {
         "generated_at": now_iso(),
         "batch": overview["batch"],
         "thresholds": {
-            "high_temp_diff_k": 8.0, "medium_temp_diff_k": 4.0,
-            "contradiction_spread_k": 3.0, "distance_tolerance_m": 1.0,
+            "high_temp_diff_k": HIGH_TEMP_K, "medium_temp_diff_k": MED_TEMP_K,
+            "contradiction_spread_k": CONTRADICTION_SPREAD_K,
+            "distance_tolerance_m": DISTANCE_TOL_M,
         },
         "joints": joints_out,
         "gate": {"sealable": overview["sealable"], "blockers": overview["blockers"]},

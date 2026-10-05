@@ -126,6 +126,9 @@ main { max-width: 1280px; margin: 24px auto; padding: 0 20px; }
 .state-contradictory { background: rgba(249,115,22,.16); color: #fdba74; border: 1px solid var(--contradiction); }
 .badge.alive { background: rgba(34,197,94,.12); color: #86efac; border: 1px solid var(--low); }
 .badge.dead { background: rgba(100,116,139,.15); color: #94a3b8; border: 1px solid var(--dead); text-decoration: line-through; }
+.badge.warn-badge { background: rgba(245,158,11,.18); color: #fcd34d; border: 1px solid var(--medium); }
+.cov-cell { display: flex; flex-direction: column; gap: 4px; font-size: 12px; white-space: nowrap; }
+.cov-box { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; font-size: 13px; line-height: 2; }
 .block-tag { color: #fca5a5; font-size: 12px; margin-top: 4px; }
 
 .row-dead { opacity: .55; }

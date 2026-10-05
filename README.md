@@ -12,7 +12,8 @@ docker compose up --build -d
 
 启动后访问：**http://localhost:8000**
 
-> 首次启动自动建表并播种演示数据（含可比较 / 证据不足 / 相互矛盾 / 更正留痕 / 高风险已复核 等示例）。
+> 首次启动自动建表并播种演示数据（含可比较 / 证据不足 / 相互矛盾 / 更正留痕 / 高风险已复核 /
+> 高风险复测已过期 等示例；“2026-10 二轮”批次的 `110kV 西联络线 K03+760 J-03` 即复测过期阻断示例）。
 > SQLite 数据保存在命名卷 `inspection-data`（容器内 `/data/inspection.db`），停止重建容器不丢数据。
 
 停止：`docker compose down`（加 `-v` 会同时删除数据卷）。
@@ -55,7 +56,68 @@ DATABASE_PATH=./inspection.db python wsgi.py
 ### 4. 封存报告固定批次快照
 
 - 封存即生成整批次 JSON 快照（全部原始观测、复核、结论版本历史），此后任何更正/补录都**不会改变**已封存内容；同一批次可封存出 v1、v2… 新版本。
-- **封存门槛**：批次内每个高风险接头都必须具备**当前复测读数**或**明确人工复核意见**，否则整份报告拒绝封存，并在“批次复核”页列出全部阻断原因。
+- **封存门槛**：批次内每个高风险接头都必须具备**覆盖最新证据的当前复测读数**或**覆盖最新证据的明确人工复核意见**，否则整份报告拒绝封存（HTTP 400，沿用现有 `{"error": ...}` 响应、不生成任何报告），并在“批次复核”页列出全部阻断原因。
+
+#### 复测 / 复核意见“覆盖最新证据”的判定规则
+
+判定对象是**同一接头、同一批次**，且一律按记录上的观测/复核时间 `recorded_at` 与**更正链**计算，
+与该条记录何时录入（提交）数据库无关：
+
+1. **最新证据时间** = 当前有效观测（`superseded=0`）中最大的 `recorded_at`。
+2. **复测读数**只有同时满足以下条件才算“当前复测、覆盖最新证据”：
+   - 本身未被更正（未处于更正链中被取代的一环；`superseded=1` 的复测**不算当前证据**）；
+   - 其 `recorded_at` **不早于**最新证据时间。
+   - 若仍有效但时间早于最新有效观测 → **复测已过期**，封存阻断并要求“补充覆盖最新证据的复测”；
+   - 若复测已被更正 → 明确阻断“原复测已被更正，不属于当前证据”。
+3. **人工复核意见**同理：最近一条意见的 `recorded_at` 不早于最新证据时间才算覆盖；更早的意见标记为“已过期”。
+4. **较早时间的回填不算新证据**：后补录入一条 `recorded_at` 更早的普通观测（仅因提交较晚），**不会**使时间更晚的复测/复核意见过期。
+5. 阻断时，该接头在批次总览中给出阻断原因，且其**当前结论的原因、处置清单（补复测 / 补明确意见）与复测状态保持一致**；
+   后续补上覆盖新证据的复测读数或明确人工复核意见后，门槛才解除、方可封存。
+6. 被更正记录、更正链、失效的历史结论与**已封存快照**均原样保留；封存后的任何补录/更正都不改变既有报告。
+
+> 录入页与复核页提供可选的“记录时间”输入（留空取服务器当前时间），补录历史观测/意见时填写，
+> 系统据此区分“更晚的新证据”与“较早时间的回填”。
+
+### 4a. 判定规则的验证步骤
+
+以下 `curl` 在全新播种库上演示（也可直接在页面上操作，二轮批次已内置一个“复测过期”示例
+`110kV 西联络线 K03+760 J-03`，打开 `#/batch/2` 即可看到阻断）。
+
+```bash
+# 1) 高风险初测 + 复测（记录时间 t1、t2），此时满足门槛
+curl -s localhost:8000/api/observations -H 'Content-Type: application/json' -d '{
+  "line_id":1,"mileage":"K80+001","joint_no":"J-V","batch_id":1,
+  "load_range":"300-380A","measure_distance_m":5.0,"temp_diff_k":9.4,
+  "calib_version":"CAL-2026.07","inspector":"测试员","recorded_at":"2026-09-18T01:00:00Z"}'
+curl -s localhost:8000/api/observations -H 'Content-Type: application/json' -d '{
+  "line_id":1,"mileage":"K80+001","joint_no":"J-V","batch_id":1,
+  "load_range":"300-380A","measure_distance_m":5.0,"temp_diff_k":9.1,
+  "calib_version":"CAL-2026.07","inspector":"测试员","is_retest":1,
+  "recorded_at":"2026-09-18T03:00:00Z"}'
+
+# 2) 补录“记录时间更晚”的普通观测 → 复测过期：总览 sealable=false、blockers 列出原因
+curl -s localhost:8000/api/observations -H 'Content-Type: application/json' -d '{
+  "line_id":1,"mileage":"K80+001","joint_no":"J-V","batch_id":1,
+  "load_range":"300-380A","measure_distance_m":5.0,"temp_diff_k":3.0,
+  "calib_version":"CAL-2026.07","inspector":"测试员","recorded_at":"2026-09-19T08:00:00Z"}'
+curl -s localhost:8000/api/batches/1 | python3 -m json.tool   # 关注 blockers / 关节 retest_status=stale
+
+# 3) 封存被拒绝：400 + {error:...}，且不产生报告
+curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8000/api/batches/1/seal   # 400
+
+# 4) 补上覆盖新证据的复测（recorded_at 不早于最新观测）→ 门槛解除，可封存
+curl -s localhost:8000/api/observations -H 'Content-Type: application/json' -d '{
+  "line_id":1,"mileage":"K80+001","joint_no":"J-V","batch_id":1,
+  "load_range":"300-380A","measure_distance_m":5.0,"temp_diff_k":8.6,
+  "calib_version":"CAL-2026.07","inspector":"测试员","is_retest":1,
+  "recorded_at":"2026-09-19T10:00:00Z"}'
+curl -s -X POST localhost:8000/api/batches/1/seal                                # {"report_id":..,"version":..}
+```
+
+另两类边界可同样验证：补录 `recorded_at` **更早**的普通观测不会让复测过期（`retest_status` 仍为 `current`）；
+用“更正已有读数”把复测本身更正掉后，阻断原因变为“原复测已被更正，不属于当前证据”。
+人工复核意见过期/覆盖的验证见 `POST /api/reviews`（同样支持 `recorded_at`）。
+
 
 ### 5. 证据链页面
 

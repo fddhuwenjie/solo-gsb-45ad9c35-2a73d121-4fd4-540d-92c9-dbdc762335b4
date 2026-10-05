@@ -44,6 +44,58 @@ function setActiveNav() {
   });
 }
 
+/* ---------------- 复测/复核覆盖判定 ---------------- */
+/* 后端按 recorded_at 判定，前端仅用于展示封存后的旧快照（其关节字段可能缺失） */
+function timeKey(s) {
+  return s ? new Date(s).getTime() || s : "";
+}
+
+function coverageOf(observations, reviews) {
+  const live = (observations || []).filter((o) => !o.superseded);
+  const supersededRetests = (observations || []).filter((o) => o.is_retest && o.superseded);
+  const retests = live.filter((o) => o.is_retest);
+  const latestAt = live.length
+    ? live.reduce((m, o) => (timeKey(o.recorded_at) >= timeKey(m) ? o.recorded_at : m),
+                  live[0].recorded_at)
+    : null;
+  let retestStatus = "none";
+  let latestRetestAt = null;
+  if (retests.length) {
+    const rt = retests.reduce((m, o) =>
+      (timeKey(o.recorded_at) >= timeKey(m.recorded_at) ? o : m));
+    latestRetestAt = rt.recorded_at;
+    retestStatus = latestAt && timeKey(rt.recorded_at) >= timeKey(latestAt)
+      ? "current" : "stale";
+  } else if (supersededRetests.length) {
+    retestStatus = "superseded";
+  }
+  let reviewStatus = "none";
+  let latestReviewAt = null;
+  if (reviews && reviews.length) {
+    const rv = reviews.reduce((m, r) =>
+      (timeKey(r.recorded_at) >= timeKey(m.recorded_at) ? r : m));
+    latestReviewAt = rv.recorded_at;
+    reviewStatus = latestAt && timeKey(rv.recorded_at) >= timeKey(latestAt)
+      ? "current" : "stale";
+  }
+  return { retestStatus, reviewStatus, latestAt, latestRetestAt, latestReviewAt };
+}
+
+function coverageCell(j) {
+  const retestBadge = {
+    current: '<span class="badge alive">✅ 复测覆盖最新证据</span>',
+    stale: `<span class="badge warn-badge">⚠ 复测过期（${fmtTime(j.latest_retest_at)}）</span>`,
+    superseded: '<span class="badge dead">复测已被更正</span>',
+    none: '<span class="muted">无复测</span>',
+  }[j.retest_status] || '<span class="muted">无复测</span>';
+  const reviewBadge = {
+    current: '<span class="badge alive">✅ 复核意见覆盖最新证据</span>',
+    stale: `<span class="badge warn-badge">⚠ 复核意见过期（${fmtTime(j.latest_review_at)}）</span>`,
+    none: '<span class="muted">无复核意见</span>',
+  }[j.review_status] || '<span class="muted">无复核意见</span>';
+  return `<div class="cov-cell">${retestBadge}<br>${reviewBadge}</div>`;
+}
+
 /* ---------------- 录入 / 更正 / 人工复核 ---------------- */
 
 async function renderEntry() {
@@ -68,6 +120,9 @@ async function renderEntry() {
           </div>
           <label class="check"><input type="checkbox" name="is_retest"> 本次为复测读数</label>
           <label>备注 <input name="note" placeholder="可注明误录更正原因等"></label>
+          <label>观测记录时间（可选，留空取当前时间；补录历史观测请填写，格式 2026-10-02T08:00:00Z；复测是否覆盖最新证据按此时间判定）
+            <input name="recorded_at" placeholder="如 2026-10-02T08:00:00Z">
+          </label>
           <div class="correct-box">
             <label class="check"><input type="checkbox" id="correct-toggle"> 更正该接头同批次已有读数</label>
             <select name="corrects_id" id="correct-select" disabled></select>
@@ -83,6 +138,9 @@ async function renderEntry() {
           ${formLineBatch(meta, "rev")}
           <label>复核人 <input name="reviewer" required></label>
           <label>明确复核意见 <textarea name="opinion" rows="4" placeholder="现场判定、处置要求、是否认可读数等" required></textarea></label>
+          <label>复核记录时间（可选，留空取当前时间；补录历史意见请填写，格式 2026-10-02T08:00:00Z；是否覆盖最新证据按此时间判定）
+            <input name="recorded_at" placeholder="如 2026-10-02T08:00:00Z">
+          </label>
           <button class="btn primary" type="submit">提交复核意见</button>
         </form>
         <div class="legend">
@@ -113,6 +171,7 @@ async function renderEntry() {
       note: f.get("note"),
       is_retest: f.get("is_retest") ? 1 : 0,
     });
+    if (f.get("recorded_at")) body.recorded_at = f.get("recorded_at");
     if (document.getElementById("correct-toggle").checked) {
       body.corrects_id = f.get("corrects_id");
     }
@@ -133,6 +192,7 @@ async function renderEntry() {
     const body = formLineBatchValues(f, "rev");
     body.reviewer = f.get("reviewer");
     body.opinion = f.get("opinion");
+    if (f.get("recorded_at")) body.recorded_at = f.get("recorded_at");
     try {
       const r = await api("/api/reviews", { method: "POST", body: JSON.stringify(body) });
       toast(`复核意见#${r.review_id} 已保存，新结论 #${r.conclusion_id} 已生成`);
@@ -287,7 +347,7 @@ async function loadBatchOverview(batchId) {
       ov.blockers.map((b) => `<li>${esc(b)}</li>`).join("") + "</ul>";
   } else {
     gate.className = "gate ok";
-    gate.innerHTML = "<b>封存门槛已满足：</b>全部高风险接头均具备当前复测读数或明确人工复核意见。";
+    gate.innerHTML = "<b>封存门槛已满足：</b>全部高风险接头均具备覆盖最新证据的当前复测读数或明确人工复核意见（按当前有效观测的 recorded_at 与更正链判定）。";
   }
   if (ov.sealed_reports.length) {
     gate.innerHTML += `<div class="sealed-tags">历史封存：${ov.sealed_reports.map((r) =>
@@ -310,7 +370,7 @@ async function loadBatchOverview(batchId) {
     <table class="table">
       <thead><tr>
         <th>线路</th><th>里程</th><th>接头</th><th>证据状态</th><th>风险</th>
-        <th>最大温差</th><th>复测/复核</th><th>结论原因与处置</th><th></th>
+        <th>最大温差</th><th>最新证据时间</th><th>复测/复核覆盖</th><th>结论原因与处置</th><th></th>
       </tr></thead>
       <tbody>${ov.joints.map((j) => {
         const c = j.conclusion;
@@ -322,7 +382,8 @@ async function loadBatchOverview(batchId) {
               <div class="muted">有效读数 ${j.active_count} / 原始 ${j.total_count} 条</div></td>
           <td>${c ? `<span class="badge risk-${c.risk_level}">${RISK_TEXT[c.risk_level]}</span>` : "—"}</td>
           <td>${c && c.max_temp_diff_k != null ? c.max_temp_diff_k + " K" : "—"}</td>
-          <td>${j.has_retest ? "✅ 复测 " : ""}${j.review_count ? "✅ 人工复核" : (!j.has_retest ? '<span class="muted">无</span>' : "")}</td>
+          <td>${j.latest_obs_at ? `<span class="muted">${fmtTime(j.latest_obs_at)}</span>` : "—"}</td>
+          <td>${coverageCell(j)}</td>
           <td class="reason-cell">${c ? `<details><summary>${esc(c.reason.slice(0, 60))}…</summary>
               <p class="reason-full">${esc(c.reason)}</p>
               <ol class="disp">${c.dispositions.map((d) => `<li><code>${d.code}</code> ${esc(d.action)}</li>`).join("")}</ol>
@@ -377,6 +438,27 @@ async function openEvidence(jointId, batchId) {
               <td>${r.id}</td><td>${fmtTime(r.recorded_at)}</td><td>${esc(r.reviewer)}</td>
               <td>${esc(r.opinion)}</td></tr>`).join("")}</tbody></table>`
             : `<p class="muted">无人工复核记录。</p>`}
+
+          <h4>当前复测 / 复核覆盖判定</h4>
+          ${(() => {
+            const cov = coverageOf(ev.observations, ev.reviews);
+            const line = (label, status, at) => {
+              const map = {
+                current: '<span class="badge alive">覆盖最新证据</span>',
+                stale: '<span class="badge warn-badge">已过期，不覆盖最新证据</span>',
+                superseded: '<span class="badge dead">已被更正，非当前证据</span>',
+                none: '<span class="muted">无</span>',
+              };
+              return `<div>${label} ${map[status]} ${at ? `<span class="muted">${fmtTime(at)}</span>` : ""}</div>`;
+            };
+            return `<div class="cov-box">
+              <div>最新有效观测记录时间：<b>${cov.latestAt ? fmtTime(cov.latestAt) : "—"}</b></div>
+              ${line("当前复测：", cov.retestStatus, cov.latestRetestAt)}
+              ${line("人工复核意见：", cov.reviewStatus, cov.latestReviewAt)}
+              <p class="muted">判定按当前有效观测的 recorded_at 与更正链：被更正的复测不算当前证据；
+              较早时间的回填记录不会仅因提交较晚而使复测过期。</p>
+            </div>`;
+          })()}
 
           <h4>结论版本（更正/补录只令当前结论失效，历史可追溯）</h4>
           <ol class="history">
@@ -482,11 +564,24 @@ async function loadReport(id) {
     <div class="report-box">
       <h3>报告 #${r.id} · v${r.version} · ${esc(snap.batch.name)}</h3>
       <p class="muted">封存于 ${fmtTime(r.sealed_at)} ｜ 快照生成于 ${fmtTime(snap.generated_at)}（之后的更正/补录不改变本报告内容）</p>
-      <p>封存时门槛：${snap.gate.sealable ? "✅ 全部高风险接头均有当前复测或明确复核意见" : "⛔ 未满足"}</p>
+      <p>封存时门槛：${snap.gate.sealable ? "✅ 全部高风险接头均有覆盖最新证据的当前复测或明确复核意见" : "⛔ 未满足"}</p>
       <table class="table small-text">
-        <thead><tr><th>线路</th><th>里程</th><th>接头</th><th>状态</th><th>风险</th><th>最大温差</th><th>结论原因</th><th>处置</th><th>复测/复核</th></tr></thead>
+        <thead><tr><th>线路</th><th>里程</th><th>接头</th><th>状态</th><th>风险</th><th>最大温差</th><th>结论原因</th><th>处置</th><th>复测/复核覆盖</th></tr></thead>
         <tbody>${snap.joints.map((j) => {
           const c = j.current_conclusion;
+          const cov = {
+            retest_status: j.retest_status,
+            review_status: j.review_status,
+            latest_retest_at: j.latest_retest_at,
+            latest_review_at: j.latest_review_at,
+          };
+          if (!cov.retest_status || !cov.review_status) {
+            const cc = coverageOf(j.observations, j.reviews);
+            cov.retest_status = cov.retest_status || cc.retestStatus;
+            cov.review_status = cov.review_status || cc.reviewStatus;
+            cov.latest_retest_at = cov.latest_retest_at || cc.latestRetestAt;
+            cov.latest_review_at = cov.latest_review_at || cc.latestReviewAt;
+          }
           return `<tr>
             <td>${esc(j.line_name)}</td><td>${esc(j.mileage)}</td><td>${esc(j.joint_no)}</td>
             <td>${c ? `<span class="badge state-${c.state}">${STATE_TEXT[c.state]}</span>` : "—"}</td>
@@ -494,7 +589,7 @@ async function loadReport(id) {
             <td>${c && c.max_temp_diff_k != null ? c.max_temp_diff_k + "K" : "—"}</td>
             <td>${c ? esc(c.reason) : "—"}</td>
             <td>${c ? `<ol class="disp">${c.dispositions.map((d) => `<li>${esc(d.action)}</li>`).join("")}</ol>` : "—"}</td>
-            <td>${j.observations.some((o) => o.is_retest) ? "复测 " : ""}${j.reviews.length ? `人工复核×${j.reviews.length}` : ""}</td>
+            <td>${coverageCell(cov)}</td>
           </tr>`;
         }).join("")}</tbody>
       </table>
