@@ -1,7 +1,7 @@
 import json
 
 from .db import now_iso, audit
-from .evaluation import evaluate
+from .evaluation import evaluate, evidence_coverage
 
 
 # ---------- 读取辅助 ----------
@@ -47,16 +47,45 @@ def _joints_touched(conn, batch_id):
     return [r["joint_id"] for r in rows]
 
 
-def _gate_for(joint_label, concl, active_obs, reviews):
-    """高风险接头封存门槛：必须有当前复测或明确人工复核意见。"""
+def _current_coverage(conn, joint_id, batch_id):
+    """当前有效证据上的覆盖判定：复测/意见是否覆盖最新有效观测（按 recorded_at）。"""
+    active = _active_observations(conn, joint_id, batch_id)
+    reviews = _reviews(conn, joint_id, batch_id)
+    return active, reviews, evidence_coverage(active, reviews)
+
+
+def _gate_for(joint_label, concl, coverage):
+    """高风险接头封存门槛：必须有覆盖最新有效证据的当前复测或明确人工复核意见。
+
+    - 被更正的复测（superseded=1）不属于当前证据，不计入覆盖；
+    - 复测/意见的 recorded_at 早于最新有效观测时，视为已被后续证据过期；
+    - 判定只看观测 recorded_at，补录记录的提交（入库）时间晚不影响覆盖关系。
+    """
     if concl is None or concl["risk_level"] != "high":
         return None
-    has_retest = any(o["is_retest"] for o in active_obs)
-    if has_retest or len(reviews) > 0:
+    if coverage["retest_covers"] or coverage["review_covers"]:
         return None
+
+    latest_at = coverage["latest_evidence_at"]
+    details = []
+    if coverage["latest_retest_at"]:
+        details.append(
+            f"现有复测读数时间 {coverage['latest_retest_at']} 早于最新有效观测时间 {latest_at}，"
+            "复测已被后续证据过期"
+        )
+    else:
+        details.append("当前没有有效的复测读数（被更正的复测不计）")
+    if coverage["latest_review_at"]:
+        details.append(
+            f"现有复核意见时间 {coverage['latest_review_at']} 早于最新有效观测时间 {latest_at}，"
+            "复核意见已被后续证据过期"
+        )
+    else:
+        details.append("没有明确人工复核意见")
     return (
-        f"高风险接头 {joint_label} 缺少当前复测读数与明确人工复核意见，"
-        "封存前必须补齐其中至少一项"
+        f"高风险接头 {joint_label} 的复测与人工复核均未覆盖最新有效证据（{latest_at}）："
+        + "；".join(details)
+        + "。封存前必须补录覆盖该时间之后的复测读数或明确人工复核意见"
     )
 
 
@@ -226,10 +255,9 @@ def batch_overview(conn, batch_id):
     joints, blockers = [], []
     for r in rows:
         concl = _current_conclusion(conn, r["joint_id"], batch_id)
-        active = _active_observations(conn, r["joint_id"], batch_id)
-        reviews = _reviews(conn, r["joint_id"], batch_id)
+        active, reviews, coverage = _current_coverage(conn, r["joint_id"], batch_id)
         label = f"{r['line_name']} {r['mileage']} {r['joint_no']}"
-        blocker = _gate_for(label, concl, active, reviews)
+        blocker = _gate_for(label, concl, coverage)
         if blocker:
             blockers.append(blocker)
         d = dict(r)
@@ -238,6 +266,7 @@ def batch_overview(conn, batch_id):
             d["conclusion"]["dispositions"] = json.loads(concl["dispositions"])
         d["seal_blocker"] = blocker
         d["has_retest"] = any(o["is_retest"] for o in active)
+        d["coverage"] = coverage
         joints.append(d)
 
     sealed = conn.execute(
@@ -275,6 +304,7 @@ def build_snapshot(conn, batch_id):
             "reviews": [dict(rv) for rv in reviews],
             "conclusion_history": [dict(h) for h in history],
             "seal_blocker": j["seal_blocker"],
+            "coverage": j["coverage"],
         })
     return {
         "generated_at": now_iso(),
@@ -373,6 +403,8 @@ def joint_batch_evidence(conn, joint_id, batch_id):
         raise ValueError("批次不存在")
     obs = _all_observations(conn, joint_id, batch_id)
     reviews = _reviews(conn, joint_id, batch_id)
+    active = [o for o in obs if not o["superseded"]]
+    coverage = evidence_coverage(active, reviews)
     history = conn.execute(
         "SELECT * FROM conclusions WHERE joint_id=? AND batch_id=? ORDER BY id",
         (joint_id, batch_id),
@@ -386,5 +418,8 @@ def joint_batch_evidence(conn, joint_id, batch_id):
         "joint": dict(j), "batch": dict(b),
         "observations": [dict(o) for o in obs],
         "reviews": [dict(r) for r in reviews],
+        "coverage": coverage,
+        "seal_blocker": _gate_for(f"{j['line_name']} {j['mileage']} {j['joint_no']}",
+                                  _current_conclusion(conn, joint_id, batch_id), coverage),
         "conclusions": history_out,
     }

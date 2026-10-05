@@ -37,6 +37,24 @@ function fmtTime(s) {
   return s ? s.replace("T", " ").replace("Z", " UTC") : "—";
 }
 
+/* 复测/人工复核是否覆盖最新有效证据（按 recorded_at，不按提交时间） */
+function coverageBadges(cov, reviewCount) {
+  if (!cov) return "";
+  const parts = [];
+  if (cov.latest_retest_at) {
+    parts.push(cov.retest_covers
+      ? `<span class="badge alive" title="复测时间 ${esc(cov.latest_retest_at)} ≥ 最新有效观测 ${esc(cov.latest_evidence_at)}">✅ 复测覆盖最新证据</span>`
+      : `<span class="badge stale" title="复测时间 ${esc(cov.latest_retest_at)} 早于最新有效观测 ${esc(cov.latest_evidence_at)}">⚠ 复测已过期</span>`);
+  }
+  if (reviewCount > 0) {
+    parts.push(cov.review_covers
+      ? `<span class="badge alive" title="复核意见时间 ${esc(cov.latest_review_at)} ≥ 最新有效观测 ${esc(cov.latest_evidence_at)}">✅ 复核覆盖最新证据</span>`
+      : `<span class="badge stale" title="复核意见时间 ${esc(cov.latest_review_at)} 早于最新有效观测 ${esc(cov.latest_evidence_at)}">⚠ 复核意见已过期</span>`);
+  }
+  if (!parts.length) parts.push('<span class="muted">无复测 / 无复核</span>');
+  return parts.join("<br>");
+}
+
 function setActiveNav() {
   const key = location.hash.split("/")[1] || "entry";
   document.querySelectorAll("nav a").forEach((a) => {
@@ -92,6 +110,7 @@ async function renderEntry() {
             <li>中风险：温差 ≥ 4K</li>
             <li>矛盾：同条件读数温差极差 &gt; 3K</li>
             <li>测温距离差 &gt; 1m / 校准版本不同 / 负荷区间无交集 → 证据不足</li>
+            <li>高风险封存门槛：复测或复核意见的 recorded_at 不得早于最新有效观测；被更正的复测不算当前证据（与提交时间无关）</li>
           </ul>
         </div>
       </section>
@@ -287,7 +306,7 @@ async function loadBatchOverview(batchId) {
       ov.blockers.map((b) => `<li>${esc(b)}</li>`).join("") + "</ul>";
   } else {
     gate.className = "gate ok";
-    gate.innerHTML = "<b>封存门槛已满足：</b>全部高风险接头均具备当前复测读数或明确人工复核意见。";
+    gate.innerHTML = "<b>封存门槛已满足：</b>全部高风险接头均具备覆盖最新有效证据的当前复测读数或明确人工复核意见（按观测 recorded_at 判定，被更正的复测不计）。";
   }
   if (ov.sealed_reports.length) {
     gate.innerHTML += `<div class="sealed-tags">历史封存：${ov.sealed_reports.map((r) =>
@@ -310,7 +329,7 @@ async function loadBatchOverview(batchId) {
     <table class="table">
       <thead><tr>
         <th>线路</th><th>里程</th><th>接头</th><th>证据状态</th><th>风险</th>
-        <th>最大温差</th><th>复测/复核</th><th>结论原因与处置</th><th></th>
+        <th>最大温差</th><th>最新有效观测</th><th>复测/复核覆盖</th><th>结论原因与处置</th><th></th>
       </tr></thead>
       <tbody>${ov.joints.map((j) => {
         const c = j.conclusion;
@@ -322,7 +341,8 @@ async function loadBatchOverview(batchId) {
               <div class="muted">有效读数 ${j.active_count} / 原始 ${j.total_count} 条</div></td>
           <td>${c ? `<span class="badge risk-${c.risk_level}">${RISK_TEXT[c.risk_level]}</span>` : "—"}</td>
           <td>${c && c.max_temp_diff_k != null ? c.max_temp_diff_k + " K" : "—"}</td>
-          <td>${j.has_retest ? "✅ 复测 " : ""}${j.review_count ? "✅ 人工复核" : (!j.has_retest ? '<span class="muted">无</span>' : "")}</td>
+          <td><span class="muted">${j.coverage ? fmtTime(j.coverage.latest_evidence_at) : "—"}</span></td>
+          <td>${coverageBadges(j.coverage, j.review_count)}</td>
           <td class="reason-cell">${c ? `<details><summary>${esc(c.reason.slice(0, 60))}…</summary>
               <p class="reason-full">${esc(c.reason)}</p>
               <ol class="disp">${c.dispositions.map((d) => `<li><code>${d.code}</code> ${esc(d.action)}</li>`).join("")}</ol>
@@ -351,6 +371,13 @@ async function openEvidence(jointId, batchId) {
           <button class="btn small" id="modal-close">关闭</button>
         </div>
         <div class="modal-body">
+          <div class="gate ${ev.seal_blocker ? "blocked" : "ok"}">
+            <b>当前覆盖判定：</b>
+            最新有效观测时间 <b>${fmtTime(ev.coverage.latest_evidence_at)}</b><br>
+            ${coverageBadges(ev.coverage, ev.reviews.length)}
+            ${ev.seal_blocker ? `<div class="block-tag">⛔ ${esc(ev.seal_blocker)}</div>`
+              : '<span class="muted">当前复测/复核已覆盖最新证据（或该接头非高风险，无封存门槛）。</span>'}
+          </div>
           <h4>原始观测（只追加，被更正记录保留不覆盖）</h4>
           <table class="table small-text">
             <thead><tr><th>#</th><th>时间</th><th>类型</th><th>负荷</th><th>距离</th><th>温差</th><th>校准版本</th><th>巡检员</th><th>状态/备注</th></tr></thead>
@@ -482,11 +509,12 @@ async function loadReport(id) {
     <div class="report-box">
       <h3>报告 #${r.id} · v${r.version} · ${esc(snap.batch.name)}</h3>
       <p class="muted">封存于 ${fmtTime(r.sealed_at)} ｜ 快照生成于 ${fmtTime(snap.generated_at)}（之后的更正/补录不改变本报告内容）</p>
-      <p>封存时门槛：${snap.gate.sealable ? "✅ 全部高风险接头均有当前复测或明确复核意见" : "⛔ 未满足"}</p>
+      <p>封存时门槛：${snap.gate.sealable ? "✅ 全部高风险接头均有覆盖最新有效证据的当前复测或明确复核意见" : "⛔ 未满足"}</p>
       <table class="table small-text">
-        <thead><tr><th>线路</th><th>里程</th><th>接头</th><th>状态</th><th>风险</th><th>最大温差</th><th>结论原因</th><th>处置</th><th>复测/复核</th></tr></thead>
+        <thead><tr><th>线路</th><th>里程</th><th>接头</th><th>状态</th><th>风险</th><th>最大温差</th><th>结论原因</th><th>处置</th><th>复测/复核覆盖</th></tr></thead>
         <tbody>${snap.joints.map((j) => {
           const c = j.current_conclusion;
+          const reviewCount = j.reviews.length;
           return `<tr>
             <td>${esc(j.line_name)}</td><td>${esc(j.mileage)}</td><td>${esc(j.joint_no)}</td>
             <td>${c ? `<span class="badge state-${c.state}">${STATE_TEXT[c.state]}</span>` : "—"}</td>
@@ -494,7 +522,10 @@ async function loadReport(id) {
             <td>${c && c.max_temp_diff_k != null ? c.max_temp_diff_k + "K" : "—"}</td>
             <td>${c ? esc(c.reason) : "—"}</td>
             <td>${c ? `<ol class="disp">${c.dispositions.map((d) => `<li>${esc(d.action)}</li>`).join("")}</ol>` : "—"}</td>
-            <td>${j.observations.some((o) => o.is_retest) ? "复测 " : ""}${j.reviews.length ? `人工复核×${j.reviews.length}` : ""}</td>
+            <td>${j.coverage
+                ? coverageBadges(j.coverage, reviewCount)
+                : `${j.observations.some((o) => o.is_retest && !o.superseded) ? "复测 " : ""}${j.reviews.length ? `人工复核×${j.reviews.length}` : ""}`}
+              ${j.seal_blocker ? `<div class="block-tag">⛔ ${esc(j.seal_blocker)}</div>` : ""}</td>
           </tr>`;
         }).join("")}</tbody>
       </table>
